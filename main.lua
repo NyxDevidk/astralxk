@@ -110,6 +110,8 @@ local State = {
     WebhookMinRarity = "Mythical",
     WebhookSummary = false,
     WebhookInterval = 30, -- minutes
+    WebhookEvents = false, -- raid/defense finished, key obtained, world unlocked
+    LastStatus = "", -- latest character-activity line (setStatus)
     GachaKeys = {}, -- [gachaKey] = true
     GachaDelay = 0,
     GachaMode = "Rodizio", -- "Rodizio": every selected gacha in turn; "Meta": a few at a time until the target
@@ -159,6 +161,7 @@ local function updateBody(handle, text)
 end
 
 local function setStatus(text)
+    State.LastStatus = text -- the webhook summary reports the latest activity line
     for _, handle in ipairs(statusHandles) do
         updateBody(handle, text)
     end
@@ -1209,6 +1212,14 @@ do
             State.WebhookMinRarity = value
         end,
     }, "WebhookMinRarity")
+    webhookSection:Header({ Text = "Eventos" })
+    webhookSection:Toggle({
+        Name = "Enviar eventos (raid/defense, chaves, mundos)",
+        Default = false,
+        Callback = function(value)
+            State.WebhookEvents = value
+        end,
+    }, "WebhookEvents")
     webhookSection:Header({ Text = "Resumo periodico" })
     webhookSection:Toggle({
         Name = "Enviar resumo",
@@ -2526,6 +2537,11 @@ end
 
 function defense.hasDps()
     return BigNum.IsPositive(dpsPeak)
+end
+
+-- Formatted DPS for the webhook: now, peak.
+function defense.dpsText()
+    return FormatUtil.Number(dpsNow, 2), FormatUtil.Number(dpsPeak, 2)
 end
 
 -- Key stock of a raid or defense: have, need, itemId, worldId, total waves, solo wave estimate.
@@ -3949,22 +3965,51 @@ do
         }
     end
 
-    function Webhook.drop(category, name, rarity, extra)
-        if not State.WebhookDrops or not currentUrl() then
-            return
+    local FormatUtilHook = Library.getUtil("FormatUtil")
+    local DefenseConfigHook = Library.getConfig("DefenseConfig")
+    local raresThisSession = 0
+
+    local function num(value)
+        local ok, text = pcall(FormatUtilHook.Number, value, 2)
+        return ok and tostring(text) or tostring(value)
+    end
+
+    -- Discord limits: 1024 chars per field value, 25 fields and 6000 chars per message.
+    local function field(name, value, inline)
+        value = tostring(value == nil and "-" or value)
+        if value == "" then
+            value = "-"
         end
-        local rank = RARITY_ORDER[rarity]
-        if not rank or rank < (RARITY_ORDER[State.WebhookMinRarity] or RARITY_ORDER.Mythical) then
-            return
+        if #value > 1000 then
+            value = value:sub(1, 997) .. "..."
         end
-        if isRepeat(seen, category .. "|" .. tostring(name) .. "|" .. rarity) then
-            return
+        return { name = name, value = value, inline = inline == true }
+    end
+
+    local function uptimeText()
+        local uptime = math.floor(os.clock() - startedAt)
+        return ("%dh %02dm"):format(uptime // 3600, uptime % 3600 // 60)
+    end
+
+    -- What the character is doing right now, as one short line.
+    local function activityText()
+        local parts = { "Dono: " .. tostring(State.Owner or "nenhum") }
+        if raid.active then
+            parts[#parts + 1] = ("%s wave %s/%s"):format(raid.label, tostring(raid.wave), tostring(raid.total))
         end
-        local ping = tostring(State.WebhookPing or ""):gsub("%D", "")
-        enqueue({
-            content = ping ~= "" and ("<@" .. ping .. ">") or nil,
-            embeds = { embed("Drop raro: " .. tostring(name), ("**%s** (%s)%s"):format(category, rarity, extra or ""), EMBED_COLORS[rarity] or 0x95A5A6) },
-        })
+        local st = defense.state and defense.state()
+        if st and st.InDefense then
+            parts[#parts + 1] = ("Defense %s wave %s/%s"):format(tostring(st.ActiveKey), tostring(defense.wave), tostring(defense.total))
+        end
+        local full = defense.full
+        if State.FullAuto and full then
+            if full.choice then
+                parts[#parts + 1] = ("Full Auto: %s %s"):format(full.choice.kind, full.choice.key)
+            elseif full.farm then
+                parts[#parts + 1] = "Full Auto: farmando " .. tostring(full.farm.item)
+            end
+        end
+        return table.concat(parts, " | ")
     end
 
     local function activeFeatures()
@@ -3974,25 +4019,228 @@ do
                 list[#list + 1] = key:sub(5)
             end
         end
+        if State.FullAuto then
+            list[#list + 1] = "FullAuto"
+        end
         table.sort(list)
         return #list > 0 and table.concat(list, ", ") or "nenhuma"
     end
 
-    local function summary(title)
-        local gachaRolls = 0
-        for _, count in pairs(rollStats.gachaRolls) do
-            gachaRolls += count
+    -- Every raid/defense key the player owns: "Nome: n".
+    local function keyLines()
+        local lines = {}
+        for key in pairs(RaidConfig:GetAllRaids()) do
+            local info = RaidConfig:GetRaid(key)
+            local cost = info and info.Cost
+            local have = cost and tonumber(PlayerData.Data[cost.ItemId]) or 0
+            if have > 0 then
+                lines[#lines + 1] = ("%s: %d"):format(info.Name or key, have)
+            end
         end
-        local uptime = math.floor(os.clock() - startedAt)
-        return embed(title, nil, 0x3498DB, {
-            { name = "Tempo ativo", value = ("%dh %02dm"):format(uptime // 3600, uptime % 3600 // 60), inline = true },
-            { name = "Mundo", value = tostring(PlayerData.Data.CurrentWorld), inline = true },
-            { name = "Gacha rolls", value = tostring(gachaRolls), inline = true },
-            { name = "Star", value = ("%d aberturas, %d pets"):format(rollStats.starOpens, rollStats.starPets), inline = true },
-            { name = "Pets apagados", value = tostring(rollStats.sold), inline = true },
-            { name = "Funcoes ativas", value = activeFeatures() },
+        for key in pairs(DefenseConfigHook:GetAllDefenses()) do
+            local info = DefenseConfigHook:GetDefense(type(key) == "string" and key or tostring(key))
+            local cost = info and info.Cost
+            local have = cost and tonumber(PlayerData.Data[cost.ItemId]) or 0
+            if have > 0 then
+                lines[#lines + 1] = ("%s: %d"):format(info.Name or tostring(key), have)
+            end
+        end
+        table.sort(lines)
+        return #lines > 0 and table.concat(lines, "\n") or "nenhuma"
+    end
+
+    -- Totals at hub start, so the summary can show what this session gained.
+    local baseline = {}
+    local TRACKED = {
+        { "TotalGachaRolls", "Gacha rolls" }, { "TotalGrimoireRolls", "Grimoire rolls" },
+        { "TotalEggsOpened", "Stars abertas" }, { "TotalPetPassiveRolls", "Passivas de pet" },
+        { "TotalSwordPassiveRolls", "Passivas de espada" }, { "TotalPlayerPassiveRolls", "Passivas do jogador" },
+        { "TotalShadowPassiveRolls", "Passivas de shadow" }, { "TotalTitanPassiveRolls", "Passivas de titan" },
+        { "TotalGamemodeWaves", "Waves de gamemode" }, { "GlobalDefenseWaves", "Waves de defense" },
+        { "Level", "Niveis" }, { "Rank", "Ranks" },
+    }
+    for _, entry in ipairs(TRACKED) do
+        baseline[entry[1]] = tonumber(PlayerData.Data[entry[1]]) or 0
+    end
+    baseline.Power = PlayerData.Data.Power
+    baseline.Yen = PlayerData.Data.Yen
+
+    local function sessionLines()
+        local lines = {}
+        for _, entry in ipairs(TRACKED) do
+            local gained = (tonumber(PlayerData.Data[entry[1]]) or 0) - (baseline[entry[1]] or 0)
+            if gained ~= 0 then
+                lines[#lines + 1] = ("%s: +%s"):format(entry[2], num(gained))
+            end
+        end
+        lines[#lines + 1] = ("Pets apagados: %d | Itens coletados: %d"):format(rollStats.sold, rollStats.collected or 0)
+        lines[#lines + 1] = ("Stars (hub): %d aberturas, %d pets"):format(rollStats.starOpens, rollStats.starPets)
+        lines[#lines + 1] = ("Drops raros: %d"):format(raresThisSession)
+        return table.concat(lines, "\n")
+    end
+
+    -- Best gacha rarity counts ("Divine x3, Secret x5 ...") plus the grimoire, player and sword passives.
+    local function bestLines()
+        local data = PlayerData.Data
+        local counts = {}
+        for _, rarity in pairs(type(data.EquippedGachas) == "table" and data.EquippedGachas or {}) do
+            counts[rarity] = (counts[rarity] or 0) + 1
+        end
+        local order = { "Astral", "Divine", "Secret", "Mythical", "Legendary", "Epic", "Rare", "Uncommon", "Common" }
+        local parts = {}
+        for _, rarity in ipairs(order) do
+            if counts[rarity] then
+                parts[#parts + 1] = ("%s x%d"):format(rarity, counts[rarity])
+            end
+        end
+        local lines = { "Gachas: " .. (#parts > 0 and table.concat(parts, ", ") or "-") }
+        for key, slots in pairs(type(data.ActiveGrimoires) == "table" and data.ActiveGrimoires or {}) do
+            if type(slots) == "table" then
+                lines[#lines + 1] = ("Grimoire %s: %s / %s"):format(key, tostring(slots.Slot1 or "-"), tostring(slots.Slot2 or "-"))
+            end
+        end
+        local active = data.ActivePassive
+        lines[#lines + 1] = "Passiva do jogador: " .. (type(active) == "table" and ("%s (%s)"):format(tostring(active.Name), tostring(active.Rarity)) or "-")
+        local sword = data.EquippedSword
+        if type(sword) == "table" and type(data.SwordPassives) == "table" then
+            local key = ("%s_%s_%d_%d"):format(tostring(sword.SwordKey), tostring(sword.Rarity), sword.Level or 0, sword.Index or 1)
+            local passive = data.SwordPassives[key]
+            lines[#lines + 1] = "Passiva da espada: " .. (type(passive) == "table" and ("%s (%s)"):format(tostring(passive.Name), tostring(passive.Rarity)) or "-")
+        end
+        return table.concat(lines, "\n")
+    end
+
+    local function tokenLines()
+        local data = PlayerData.Data
+        local lines = {}
+        for _, entry in ipairs({
+            { "PetPassiveToken", "Pet passive" }, { "BreathToken", "Breath (espada)" }, { "PassiveToken", "Passive (jogador)" },
+            { "ShadowPassiveToken", "Shadow passive" }, { "TitanPassiveToken", "Titan passive" }, { "GrimoireToken", "Grimoire" },
+            { "GrimoirePassiveToken", "Grimoire passive" }, { "WorldToken", "World" }, { "CursesCoin", "CursesCoin" },
+            { "DefenseCoin", "DefenseCoin" },
+        }) do
+            local have = tonumber(data[entry[1]])
+            if have and have > 0 then
+                lines[#lines + 1] = ("%s: %s"):format(entry[2], num(have))
+            end
+        end
+        return #lines > 0 and table.concat(lines, "\n") or "-"
+    end
+
+    function Webhook.drop(category, name, rarity, extra)
+        local rank = RARITY_ORDER[rarity]
+        if not rank or rank < (RARITY_ORDER[State.WebhookMinRarity] or RARITY_ORDER.Mythical) then
+            return
+        end
+        raresThisSession += 1 -- counted even with drop posts off, for the summary
+        if not State.WebhookDrops or not currentUrl() then
+            return
+        end
+        if isRepeat(seen, category .. "|" .. tostring(name) .. "|" .. rarity) then
+            return
+        end
+        local ping = tostring(State.WebhookPing or ""):gsub("%D", "")
+        local data = PlayerData.Data
+        enqueue({
+            content = ping ~= "" and ("<@" .. ping .. ">") or nil,
+            embeds = { embed("Drop raro: " .. tostring(name), ("**%s** (%s)%s"):format(category, rarity, extra or ""), EMBED_COLORS[rarity] or 0x95A5A6, {
+                field("Item", name, true),
+                field("Raridade", rarity, true),
+                field("Origem", category, true),
+                field("Mundo", data.CurrentWorld, true),
+                field("Nivel / Rank", ("%s / %s"):format(tostring(data.Level), tostring(data.Rank)), true),
+                field("Drops raros na sessao", raresThisSession, true),
+                field("Atividade", activityText()),
+            }) },
         })
     end
+
+    -- Several embeds: account, session gains, activity, resources and best rolls.
+    local function summary(title)
+        local data = PlayerData.Data
+        local player = game:GetService("Players").LocalPlayer
+        local dpsNow, dpsPeak = "-", "-"
+        if defense.dpsText then
+            dpsNow, dpsPeak = defense.dpsText()
+        end
+        return {
+            embed(title, ("**%s** (@%s) | ativo ha %s"):format(player.DisplayName, player.Name, uptimeText()), 0x3498DB, {
+                field("Nivel", data.Level, true),
+                field("Rank", data.Rank, true),
+                field("Promotion", data.PromotionRank, true),
+                field("Power", num(data.Power), true),
+                field("Yen", num(data.Yen), true),
+                field("DPS agora / pico", ("%s / %s"):format(dpsNow, dpsPeak), true),
+                field("Mundo atual", data.CurrentWorld, true),
+                field("Quest", data.QuestIndex, true),
+                field("Servidor", game.JobId:sub(1, 8), true),
+            }),
+            embed("Sessao", nil, 0x2ECC71, {
+                field("Ganhos desde o inicio", sessionLines()),
+                field("Power ganho", ("%s -> %s"):format(num(baseline.Power), num(data.Power)), true),
+                field("Yen ganho", ("%s -> %s"):format(num(baseline.Yen), num(data.Yen)), true),
+            }),
+            embed("Atividade", nil, 0xF1C40F, {
+                field("Agora", activityText()),
+                field("Ultimo status", State.LastStatus),
+                field("Funcoes ligadas", activeFeatures()),
+            }),
+            embed("Recursos", nil, 0x9B59B6, {
+                field("Chaves de raid/defense", keyLines(), true),
+                field("Tokens", tokenLines(), true),
+            }),
+            embed("Melhores", nil, 0xE67E22, {
+                field("Raridades", bestLines()),
+            }),
+        }
+    end
+
+    -- Events: raid/defense finished (with the last wave), key obtained, world unlocked.
+    local function event(title, description, color, fields)
+        if State.WebhookEvents and currentUrl() then
+            enqueue({ embeds = { embed(title, description, color, fields) } })
+        end
+    end
+    local lastDefense = { key = nil, wave = 0, total = 0 }
+    connections[#connections + 1] = Library.getBridge("DefenseState"):Connect(function(payload)
+        if type(payload) == "table" then
+            lastDefense.key = payload.DefenseKey or lastDefense.key
+            lastDefense.wave = tonumber(payload.Wave) or lastDefense.wave
+            lastDefense.total = tonumber(payload.TotalWaves) or lastDefense.total
+        end
+    end)
+    connections[#connections + 1] = Library.getBridge("DefenseEnded"):Connect(function()
+        event("Defense terminada", ("%s: wave %d/%d"):format(tostring(lastDefense.key), lastDefense.wave, lastDefense.total), 0x1ABC9C, {
+            field("Chaves restantes", keyLines()),
+        })
+        lastDefense.wave = 0
+    end)
+    connections[#connections + 1] = Library.getBridge("RaidEnded"):Connect(function()
+        event("Raid terminada", ("%s: wave %s/%s"):format(tostring(raid.label), tostring(raid.wave), tostring(raid.total)), 0x1ABC9C, {
+            field("Chaves restantes", keyLines()),
+        })
+    end)
+    task.spawn(function()
+        local keysBefore, worldsBefore = keyLines(), {}
+        for id = 1, 30 do
+            worldsBefore[id] = TeleportController:IsWorldUnlocked(id)
+        end
+        while State.Running do
+            task.wait(10)
+            local keysNow = keyLines()
+            if keysNow ~= keysBefore then
+                event("Chaves mudaram", nil, 0x3498DB, { field("Antes", keysBefore, true), field("Agora", keysNow, true) })
+                keysBefore = keysNow
+            end
+            for id = 1, 30 do
+                local unlocked = TeleportController:IsWorldUnlocked(id)
+                if unlocked and not worldsBefore[id] then
+                    event("Mundo liberado", ("Mundo %d"):format(id), 0x2ECC71)
+                end
+                worldsBefore[id] = unlocked
+            end
+        end
+    end)
 
     function Webhook.test()
         if not httpRequest then
@@ -4003,7 +4251,7 @@ do
             Window:Notify({ Title = "Webhook", Description = "URL invalida. Use https://discord.com/api/webhooks/...", Lifetime = 5 })
             return
         end
-        enqueue({ embeds = { summary("Teste do AstralX") } })
+        enqueue({ embeds = summary("Teste do AstralX") })
         Window:Notify({ Title = "Webhook", Description = "Teste enviado para a fila.", Lifetime = 4 })
     end
 
@@ -4048,7 +4296,7 @@ do
             if State.WebhookSummary and currentUrl() then
                 if os.clock() - last >= State.WebhookInterval * 60 then
                     last = os.clock()
-                    enqueue({ embeds = { summary("Resumo AstralX") } })
+                    enqueue({ embeds = summary("Resumo AstralX") })
                 end
             else
                 last = os.clock()
@@ -4141,6 +4389,7 @@ connections[#connections + 1] = OpenEggBridge:Connect(function(_, pets)
     end
 end)
 
+getgenv().AstralX.Webhook = Webhook -- .test() sends the full summary, for checking the embeds
 getgenv().AstralX.TestAlert = function(payload)
     inspectDrops(payload)
 end
@@ -4265,6 +4514,7 @@ local function collectStep()
     setStatus(("Coletando %s (mundo %d)"):format(pick.kind, pick.world))
     if claimPickup(pick) then
         collectedCount += 1
+        rollStats.collected = collectedCount
         pickupCacheAt = 0
     elseif State.Owner == "Collect" then -- lost control mid-claim is not a failure
         skipPickup(pick.item)
